@@ -139,7 +139,7 @@ class SchedulerService:
                 )
                 users = result.scalars().all()
                 
-                logger.info(f"Found {len(users)} users with reminders enabled")
+                logger.debug(f"Found {len(users)} users with reminders enabled")
                 
                 for user in users:
                     try:
@@ -222,7 +222,6 @@ class SchedulerService:
     
     async def _check_and_send_daily_reports(self):
         """Проверка и отправка вечерних отчётов"""
-        logger.info("Checking for daily reports to send...")
         
         try:
             async with AsyncSessionLocal() as session:
@@ -244,15 +243,14 @@ class SchedulerService:
                         report_time = user.daily_report_time or "21:00"
                         try:
                             target_hour = int(report_time.split(":")[0])
-                        except:
+                        except (ValueError, IndexError):
                             target_hour = 21
                         
-                        # Получаем текущий час в часовом поясе пользователя
                         try:
                             tz = pytz.timezone(user.timezone or "Europe/Moscow")
                             user_hour = datetime.now(tz).hour
-                        except:
-                            user_hour = datetime.now().hour
+                        except (pytz.UnknownTimeZoneError, Exception):
+                            user_hour = datetime.now(pytz.timezone("Europe/Moscow")).hour
                         
                         # Отправляем только в нужное время (±1 час)
                         if abs(user_hour - target_hour) > 1:
@@ -299,7 +297,6 @@ class SchedulerService:
     
     async def _check_and_send_weekly_reports(self):
         """Проверка и отправка еженедельных отчётов"""
-        logger.info("Checking for weekly reports to send...")
         
         try:
             async with AsyncSessionLocal() as session:
@@ -393,8 +390,7 @@ class SchedulerService:
     
     async def _check_and_send_weigh_reminders(self):
         """Проверка и отправка напоминаний взвеситься"""
-        logger.info("Checking for weigh reminders to send...")
-        today = date.today()
+        today = datetime.now(pytz.timezone("Europe/Moscow")).date()
         
         try:
             async with AsyncSessionLocal() as session:
@@ -440,7 +436,6 @@ class SchedulerService:
     
     async def _check_challenge_progress(self):
         """Проверка прогресса по активным челленджам"""
-        logger.info("Checking challenge progress...")
         
         try:
             async with AsyncSessionLocal() as session:

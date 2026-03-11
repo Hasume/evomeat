@@ -1618,6 +1618,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "toggle_weigh_reminder":
         await toggle_weigh_reminder_callback(query)
     
+    # === ЛЕНИВЫЙ РЕЖИМ (фото) ===
+    elif data == "diary_add_from_photo":
+        await add_photo_estimate_to_diary(query, context)
+    elif data == "refine_photo_estimate":
+        await query.message.edit_text(
+            "📝 Напиши уточнение — что было на тарелке и примерный размер порции.\n"
+            "Например: «куриная грудка 200г с рисом 150г»"
+        )
 
 
 # Временно отключено - будет доработано позже
@@ -2594,6 +2602,58 @@ async def toggle_weigh_reminder_callback(query):
 # =====================
 # ЛЕНИВЫЙ РЕЖИМ (фото)
 # =====================
+
+async def add_photo_estimate_to_diary(query, context: ContextTypes.DEFAULT_TYPE):
+    """Записать оценку по фото в дневник"""
+    user = query.from_user
+    estimate = context.user_data.get('last_photo_estimate')
+    
+    if not estimate:
+        await query.message.edit_text("❌ Оценка устарела. Отправь фото ещё раз.")
+        return
+    
+    description = estimate.get('description', 'Блюдо по фото')
+    
+    try:
+        nutrition = await ai_service.calculate_nutrition_from_text(description)
+        
+        if not nutrition:
+            await query.message.edit_text("❌ Не удалось рассчитать БЖУ. Попробуй описать блюдо текстом.")
+            return
+        
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.telegram_id == user.id)
+            )
+            db_user = result.scalar_one_or_none()
+            
+            if db_user:
+                entry = DiaryEntry(
+                    user_id=db_user.id,
+                    food_name=description,
+                    calories=nutrition.get("calories", 0),
+                    protein=nutrition.get("protein", 0),
+                    fats=nutrition.get("fats", 0),
+                    carbs=nutrition.get("carbs", 0),
+                    date=datetime.now(),
+                    data_source=DataSource.AI_ESTIMATE
+                )
+                session.add(entry)
+                await session.commit()
+                
+                await query.message.edit_text(
+                    f"✅ Записано в дневник!\n\n"
+                    f"🍽 {description}\n"
+                    f"🔥 {nutrition.get('calories', 0)} ккал | "
+                    f"Б: {nutrition.get('protein', 0)}г | "
+                    f"Ж: {nutrition.get('fats', 0)}г | "
+                    f"У: {nutrition.get('carbs', 0)}г\n\n"
+                    f"⚠️ Это грубая оценка по фото."
+                )
+    except Exception as e:
+        logger.error(f"Error adding photo estimate to diary: {e}")
+        await query.message.edit_text("❌ Ошибка при записи. Попробуй ещё раз.")
+
 
 async def handle_photo_lazy_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка фото в ленивом режиме"""
