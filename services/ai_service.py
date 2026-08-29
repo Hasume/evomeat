@@ -5,6 +5,7 @@ from openai import AsyncOpenAI
 from typing import List, Dict, Optional
 from config import settings
 from prompts import get_prompt
+from utils.allergens import ALLERGEN_SOURCES
 import json
 import logging
 import re
@@ -12,12 +13,68 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def _num(value) -> float:
+    """Привести значение к числу: модель может вернуть строку или null."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"-?\d+(?:[.,]\d+)?", str(value))
+    return float(match.group().replace(",", ".")) if match else 0.0
+
+
+class AIServiceUnavailable(Exception):
+    """
+    Внешний сервис недоступен (нет ключа, квота, сеть, таймаут).
+
+    Отделяет поломку инфраструктуры от «модель не поняла запрос»: раньше оба
+    случая давали пользователю совет «уточните формулировку», и при отозванном
+    ключе люди бесконечно переписывали корректные сообщения.
+    """
+
+
+def extract_json(content: str) -> Optional[dict]:
+    """
+    Достать JSON-объект из ответа модели.
+
+    Модель может вернуть JSON в markdown-обёртке или дописать текст вокруг,
+    а при отказе выполнить запрос — ответить обычной прозой.
+    """
+    if not content:
+        return None
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    braced = re.search(r"\{.*\}", content, re.DOTALL)
+    if braced:
+        try:
+            return json.loads(braced.group())
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
 class AIService:
     """Сервис для работы с AI (генерация рецептов, рекомендации)"""
-    
+
+    # Модель с поддержкой строгого JSON и анализа изображений.
+    MODEL_FAST = "gpt-4o-mini"
+    MODEL_SMART = "gpt-4o"
+
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    
+        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, timeout=60.0)
+
     async def detect_intent(self, user_message: str) -> Dict:
         """
         Определить намерение пользователя из сообщения
@@ -63,33 +120,38 @@ class AIService:
 
         try:
             response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",  # быстрая модель для определения intent
+                model=self.MODEL_FAST,  # быстрая модель для определения intent
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
                 temperature=0.3,
-                max_tokens=200
+                max_tokens=300,
+                response_format={"type": "json_object"}
             )
-            
-            result = json.loads(response.choices[0].message.content)
-            logger.info(f"Detected intent: {result.get('intent')} (confidence: {result.get('confidence')})")
-            return result
-            
+
+            result = extract_json(response.choices[0].message.content)
+            if result:
+                logger.info(f"Detected intent: {result.get('intent')} (confidence: {result.get('confidence')})")
+                return result
+            logger.warning("Intent response was not valid JSON, falling back to keywords")
+
         except Exception as e:
             logger.error(f"Error detecting intent: {e}")
-            # Fallback: базовое определение
-            message_lower = user_message.lower()
-            if any(word in message_lower for word in ['привет', 'здравствуй', 'добрый', 'hey', 'hi']):
-                return {"intent": "greeting", "confidence": 0.8, "entities": {}}
-            elif any(word in message_lower for word in ['статистик', 'итоги', 'как я сегодня', 'дашборд', 'сколько съел']):
-                return {"intent": "statistics", "confidence": 0.9, "entities": {}}
-            elif any(word in message_lower for word in ['рецепт', 'приготовить', 'сделать', 'блюдо', 'recipe']):
-                return {"intent": "recipe_search", "confidence": 0.7, "entities": {}}
-            elif any(word in message_lower for word in ['калори', 'бжу', 'белк', 'жир', 'углевод']):
-                return {"intent": "calorie_count", "confidence": 0.7, "entities": {}}
-            else:
-                return {"intent": "general_question", "confidence": 0.5, "entities": {}}
+
+        # Запасное определение по ключевым словам: intent нужен только для
+        # маршрутизации, поэтому здесь деградация допустима и незаметна.
+        message_lower = user_message.lower()
+        if any(word in message_lower for word in ['привет', 'здравствуй', 'добрый', 'hey', 'hi']):
+            return {"intent": "greeting", "confidence": 0.8, "entities": {}}
+        elif any(word in message_lower for word in ['статистик', 'итоги', 'как я сегодня', 'дашборд', 'сколько съел']):
+            return {"intent": "statistics", "confidence": 0.9, "entities": {}}
+        elif any(word in message_lower for word in ['рецепт', 'приготовить', 'сделать', 'блюдо', 'recipe']):
+            return {"intent": "recipe_search", "confidence": 0.7, "entities": {}}
+        elif any(word in message_lower for word in ['калори', 'бжу', 'белк', 'жир', 'углевод']):
+            return {"intent": "calorie_count", "confidence": 0.7, "entities": {}}
+        else:
+            return {"intent": "general_question", "confidence": 0.5, "entities": {}}
     
     async def answer_general_question(self, question: str, context: Optional[Dict] = None) -> str:
         """
@@ -105,30 +167,67 @@ class AIService:
         
         try:
             response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self.MODEL_FAST,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": question + context_info}
                 ],
                 temperature=0.7,
-                max_tokens=500
+                max_tokens=700
             )
-            
+
             return response.choices[0].message.content
-            
+
         except Exception as e:
             logger.error(f"Error answering question: {e}")
-            return "Извините, у меня возникла проблема с обработкой вашего вопроса. Попробуйте переформулировать или используйте команды /help"
+            raise AIServiceUnavailable(str(e)) from e
     
+    def find_conflicting_allergens(
+        self,
+        ingredients: List[str],
+        allergies: Optional[List[str]]
+    ) -> List[str]:
+        """
+        Найти аллергены пользователя среди запрошенных ингредиентов.
+
+        Проверка выполняется до обращения к модели: если человек просит рецепт
+        из того, что ему нельзя, ответить об этом нужно прямо, а не отдавать
+        решение модели и терять её предупреждение при разборе ответа.
+        """
+        if not allergies:
+            return []
+
+        found = []
+        text = " ".join(ingredients).lower()
+        for allergen in allergies:
+            token = str(allergen).lower().strip()
+            if not token:
+                continue
+            # Сопоставляем по корню слова: «орехи» должно находить «грецкие орехи».
+            root = token[:-1] if len(token) > 4 else token
+            related = ALLERGEN_SOURCES.get(root, [])
+            if root in text or any(word in text for word in related):
+                found.append(allergen)
+        return found
+
     async def generate_recipes(
-        self, 
+        self,
         ingredients: List[str],
         dietary_preferences: Optional[List[str]] = None,
         allergies: Optional[List[str]] = None,
         cuisine_type: Optional[str] = None
-    ) -> List[Dict]:
-        """Генерация рецептов по списку ингредиентов"""
-        
+    ) -> Dict:
+        """
+        Генерация рецептов по списку ингредиентов.
+
+        Возвращает {"recipes": [...], "blocked_allergens": [...]} — вызывающий
+        код должен различать «рецептов нет» и «рецепты нельзя из-за аллергии».
+        """
+        blocked = self.find_conflicting_allergens(ingredients, allergies)
+        if blocked:
+            logger.info(f"Recipe request blocked by allergens: {blocked}")
+            return {"recipes": [], "blocked_allergens": blocked}
+
         # Формируем ограничения
         restrictions = []
         if dietary_preferences:
@@ -137,9 +236,9 @@ class AIService:
             restrictions.append(f"АЛЛЕРГИИ (НЕ использовать): {', '.join(allergies)}")
         if cuisine_type:
             restrictions.append(f"Предпочтительная кухня: {cuisine_type}")
-        
+
         restrictions_text = "\n".join(restrictions) if restrictions else "Нет особых ограничений"
-        
+
         # Получаем промпт из модуля
         prompt = get_prompt(
             "recipe_generation",
@@ -147,31 +246,43 @@ class AIService:
             ingredients=", ".join(ingredients),
             restrictions=restrictions_text
         )
-        
+
         try:
             response = await self.client.chat.completions.create(
-                model="gpt-4",
+                model=self.MODEL_SMART,
                 messages=[
                     {"role": "system", "content": get_prompt("main")},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,
-                max_tokens=2500
+                max_tokens=2500,
+                response_format={"type": "json_object"}
             )
-            
-            content = response.choices[0].message.content
-            
-            # Парсим JSON
-            try:
-                recipes_data = json.loads(content)
-                return recipes_data.get("recipes", [])
-            except json.JSONDecodeError:
-                logger.error("Failed to parse JSON from AI response")
-                return []
-                
         except Exception as e:
             logger.error(f"Error generating recipes: {e}")
-            return []
+            raise AIServiceUnavailable(str(e)) from e
+
+        content = response.choices[0].message.content
+        recipes_data = extract_json(content)
+
+        if not recipes_data:
+            logger.error(f"Failed to parse JSON from AI response: {content[:200]!r}")
+            return {"recipes": [], "blocked_allergens": []}
+
+        recipes = [r for r in recipes_data.get("recipes", []) if self._is_valid_recipe(r)]
+        return {"recipes": recipes, "blocked_allergens": []}
+
+    @staticmethod
+    def _is_valid_recipe(recipe) -> bool:
+        """Отсеять рецепты без полей, на которые опирается отправка сообщения."""
+        if not isinstance(recipe, dict):
+            return False
+        if not recipe.get("name") or not recipe.get("instructions"):
+            return False
+        nutrition = recipe.get("nutrition")
+        if not isinstance(nutrition, dict) or "calories" not in nutrition:
+            return False
+        return isinstance(recipe.get("ingredients"), list)
     
     async def generate_weekly_plan(
         self,
@@ -227,34 +338,117 @@ class AIService:
     
     async def calculate_nutrition_from_text(self, text: str) -> Dict:
         """
-        Рассчитать калории и БЖУ из текстового описания продуктов
+        Рассчитать калории и БЖУ из текстового описания продуктов.
+
+        Всегда возвращает структуру с ключами items/total; при недоступности
+        сервиса поднимает AIServiceUnavailable, чтобы бот не выдавал сбой
+        инфраструктуры за ошибку пользователя.
         """
         system_prompt = get_prompt("calorie_calculation")
 
         try:
             response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self.MODEL_FAST,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": text}
                 ],
-                temperature=0.3,
-                max_tokens=800
+                temperature=0.2,
+                max_tokens=900,
+                response_format={"type": "json_object"}
             )
-            
-            content = response.choices[0].message.content
-            
-            # Извлекаем JSON из ответа
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-                return result
-            else:
-                return json.loads(content)
-                
         except Exception as e:
             logger.error(f"Error calculating nutrition from text: {e}")
+            raise AIServiceUnavailable(str(e)) from e
+
+        result = extract_json(response.choices[0].message.content)
+        if not result:
+            logger.error("Nutrition response was not valid JSON")
             return {}
+
+        return self._normalize_nutrition(result)
+
+    @staticmethod
+    def _normalize_nutrition(result: Dict) -> Dict:
+        """
+        Привести ответ модели к предсказуемому виду.
+
+        Гарантирует наличие amount у каждой позиции и пересчитывает total по
+        позициям — раньше форматирование обращалось к item['amount'] напрямую и
+        падало, если модель не вернула это поле.
+        """
+        items = []
+        for raw in result.get("items") or []:
+            if not isinstance(raw, dict) or not raw.get("name"):
+                continue
+            items.append({
+                "name": str(raw.get("name")),
+                "amount": str(raw.get("amount") or "порция"),
+                "cooking_method": str(raw.get("cooking_method") or "готовое"),
+                "calories": _num(raw.get("calories")),
+                "protein": _num(raw.get("protein")),
+                "fats": _num(raw.get("fats")),
+                "carbs": _num(raw.get("carbs")),
+            })
+
+        total = {
+            key: round(sum(item[key] for item in items), 1)
+            for key in ("calories", "protein", "fats", "carbs")
+        }
+
+        return {
+            # Запрос на уточнение сохраняем как есть: модель может распознать
+            # часть позиций и всё равно нуждаться в способе приготовления для
+            # остальных — гасить вопрос нельзя, иначе продукт потеряется.
+            "needs_clarification": bool(result.get("needs_clarification")),
+            "clarification_question": result.get("clarification_question"),
+            "items": items,
+            "total": total,
+        }
+
+    async def analyze_food_photo(self, image_bytes: bytes, caption: str = "") -> Dict:
+        """
+        Оценить блюдо по фотографии.
+
+        Изображение действительно отправляется в модель: прежняя версия
+        скачивала файл и оценивала только подпись к нему.
+        """
+        import base64
+
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        hint = f"\n\nПодпись пользователя: {caption}" if caption else ""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.MODEL_SMART,
+                messages=[
+                    {"role": "system", "content": get_prompt("image_analysis")},
+                    {"role": "user", "content": [
+                        {"type": "text", "text":
+                            "Определи блюдо на фото, оцени вес порции и посчитай КБЖУ. "
+                            "Ответ строго в JSON по заданной схеме." + hint},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
+                    ]},
+                ],
+                temperature=0.2,
+                max_tokens=900,
+                response_format={"type": "json_object"}
+            )
+        except Exception as e:
+            logger.error(f"Error analyzing food photo: {e}")
+            raise AIServiceUnavailable(str(e)) from e
+
+        result = extract_json(response.choices[0].message.content)
+        if not result:
+            logger.error("Photo analysis response was not valid JSON")
+            return {}
+
+        normalized = self._normalize_nutrition(result)
+        normalized["dish_name"] = result.get("dish_name") or caption or "Блюдо с фото"
+        normalized["confidence"] = result.get("confidence") or "средняя"
+        normalized["advice"] = result.get("advice") or ""
+        return normalized
     
     async def generate_response(self, prompt: str, user_id: int = None) -> str:
         """
@@ -262,10 +456,10 @@ class AIService:
         Используется для планов питания, оценки по фото и др.
         """
         system_prompt = get_prompt("main")
-        
+
         try:
             response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self.MODEL_FAST,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
@@ -273,13 +467,21 @@ class AIService:
                 temperature=0.7,
                 max_tokens=1000
             )
-            
+
             return response.choices[0].message.content
-            
+
         except Exception as e:
             logger.error(f"Error in generate_response: {e}")
-            return "Извините, произошла ошибка. Попробуйте ещё раз."
+            raise AIServiceUnavailable(str(e)) from e
     
+    # Нижние границы суточной калорийности, ниже которых рацион считается
+    # небезопасным без наблюдения врача.
+    MIN_CALORIES = {"male": 1500, "female": 1200}
+
+    # Доля TDEE, на которую максимально изменяем калораж под цель.
+    MAX_DEFICIT_SHARE = 0.20
+    MAX_SURPLUS_SHARE = 0.15
+
     async def calculate_daily_calories(
         self,
         weight: float,
@@ -289,15 +491,21 @@ class AIService:
         activity_level: str,
         goal: str
     ) -> Dict:
-        """Расчёт дневной нормы калорий и БЖУ"""
-        
+        """
+        Расчёт дневной нормы калорий и БЖУ.
+
+        Дополнительно возвращает `warnings` — список предупреждений, которые
+        бот обязан показать пользователю (например, что расчёт упёрся в
+        безопасный минимум).
+        """
+        warnings: List[str] = []
+
         # Базовый метаболизм (формула Миффлина-Сан Жеора)
         if gender.lower() == "male":
             bmr = 10 * weight + 6.25 * height - 5 * age + 5
         else:
             bmr = 10 * weight + 6.25 * height - 5 * age - 161
-        
-        # Коэффициенты активности
+
         activity_coefficients = {
             "sedentary": 1.2,
             "light": 1.375,
@@ -305,29 +513,69 @@ class AIService:
             "active": 1.725,
             "very_active": 1.9
         }
-        
+
         coefficient = activity_coefficients.get(activity_level, 1.2)
         tdee = bmr * coefficient
-        
-        # Корректировка в зависимости от цели
+
+        # Дефицит и профицит — доля от TDEE, а не фиксированные 500 ккал:
+        # для человека с небольшим весом «минус 500» съедает почти треть нормы.
         if goal == "lose_weight":
-            target_calories = tdee - 500
+            target_calories = tdee * (1 - self.MAX_DEFICIT_SHARE)
         elif goal == "gain_weight":
-            target_calories = tdee + 500
-        else:  # maintain
+            target_calories = tdee * (1 + self.MAX_SURPLUS_SHARE)
+        else:
             target_calories = tdee
-        
-        # Расчёт БЖУ (примерное распределение)
-        protein = weight * 2  # 2г на кг веса
-        fats = target_calories * 0.25 / 9  # 25% от калорий, 1г жира = 9 ккал
+
+        # Нижняя граница безопасности.
+        floor = self.MIN_CALORIES.get(gender.lower(), 1200)
+        if target_calories < floor:
+            target_calories = floor
+            warnings.append("min_calories")
+        if goal == "lose_weight" and tdee < floor:
+            # Поддержание уже ниже безопасного минимума — худеть питанием нельзя.
+            warnings.append("deficit_not_advised")
+
+        # Белок считаем от «расчётного» веса: при лишнем весе 2 г/кг фактической
+        # массы дают долю белка, несовместимую со сбалансированным рационом.
+        reference_weight = min(weight, self._healthy_reference_weight(height))
+        protein = reference_weight * 1.8
+
+        # Белок не должен занимать больше трети калорийности.
+        max_protein = target_calories * 0.35 / 4
+        if protein > max_protein:
+            protein = max_protein
+
+        # Жиры: 25% калорий, но не ниже физиологического минимума 0.8 г/кг.
+        fats = target_calories * 0.25 / 9
+        min_fats = reference_weight * 0.8
+        if fats < min_fats:
+            fats = min_fats
+
         carbs = (target_calories - (protein * 4 + fats * 9)) / 4
-        
+
+        # Углеводы не могут быть отрицательными: ужимаем белок и жиры до
+        # минимально допустимых значений, сохраняя калорийность.
+        if carbs < 50:
+            protein = min(protein, target_calories * 0.30 / 4)
+            fats = min(fats, target_calories * 0.25 / 9)
+            carbs = (target_calories - (protein * 4 + fats * 9)) / 4
+            if carbs < 0:
+                carbs = 0
+                warnings.append("macros_adjusted")
+
         return {
-            "calories": int(target_calories),
+            "calories": int(round(target_calories)),
             "protein": round(protein, 1),
             "fats": round(fats, 1),
             "carbs": round(carbs, 1),
             "bmr": round(bmr, 1),
-            "tdee": round(tdee, 1)
+            "tdee": round(tdee, 1),
+            "warnings": warnings,
         }
+
+    @staticmethod
+    def _healthy_reference_weight(height: float) -> float:
+        """Вес при ИМТ 25 для этого роста — верхняя граница для расчёта белка."""
+        meters = max(height, 100) / 100
+        return 25 * meters * meters
 

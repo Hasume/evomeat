@@ -1,6 +1,7 @@
 """
 Главный файл Telegram бота
 """
+from telegram import BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,6 +19,8 @@ from bot.handlers import (
     diary_command,
     profile_command,
     statistics_command,
+    goals_command,
+    my_recipes_command,
     handle_recipe_search,
     button_callback,
     handle_photo_lazy_mode
@@ -125,6 +128,8 @@ def setup_bot() -> Application:
     application.add_handler(CommandHandler("profile", profile_command))
     application.add_handler(CommandHandler("stats", statistics_command))
     application.add_handler(CommandHandler("statistics", statistics_command))
+    application.add_handler(CommandHandler("goals", goals_command))
+    application.add_handler(CommandHandler("saved", my_recipes_command))
     
     # Обработчик callback кнопок
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -161,6 +166,22 @@ async def start_bot():
     # Инициализация приложения
     await application.initialize()
     await application.start()
+
+    # Список команд в меню Telegram: без него команды приходится помнить наизусть
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Начало и настройка профиля"),
+            BotCommand("stats", "Итоги дня"),
+            BotCommand("diary", "Дневник питания"),
+            BotCommand("recipes", "Подобрать рецепт"),
+            BotCommand("saved", "Сохранённые рецепты"),
+            BotCommand("goals", "Цели по КБЖУ"),
+            BotCommand("profile", "Профиль"),
+            BotCommand("help", "Как пользоваться"),
+        ])
+        logger.info("Bot commands menu updated")
+    except Exception as e:
+        logger.warning(f"Could not set bot commands: {e}")
     
     # Настраиваем scheduler с ботом
     scheduler_service.set_bot(application.bot)

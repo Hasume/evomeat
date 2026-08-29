@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from database.models import User, DiaryEntry
 from database.database import AsyncSessionLocal
+from utils.allergens import product_conflicts
+from utils.telegram_ui import meal_label
 import logging
 
 logger = logging.getLogger(__name__)
@@ -144,7 +146,14 @@ class StatisticsService:
             
             # Остаток калорий
             calories_remaining = target_calories - total_calories
-            
+
+            # Разбивка по приёмам пищи — нужна, чтобы показать, где именно
+            # набрана дневная калорийность.
+            by_meal = {}
+            for entry in entries:
+                label = meal_label(entry.meal_type)
+                by_meal[label] = round(by_meal.get(label, 0) + (entry.calories or 0))
+
             return {
                 # Текущие показатели
                 "calories": round(total_calories),
@@ -166,11 +175,13 @@ class StatisticsService:
                 # Дополнительно
                 "calories_remaining": round(calories_remaining),
                 "entries_count": len(entries),
+                "by_meal": by_meal,
                 "entries": [
                     {
                         "id": e.id,
                         "time": e.date.strftime("%H:%M"),
                         "food_name": e.food_name,
+                        "meal_type": e.meal_type,
                         "calories": e.calories
                     }
                     for e in entries
@@ -249,43 +260,74 @@ class StatisticsService:
                 }
             }
     
+    @staticmethod
+    def _progress_bar(current: float, target: float, width: int = 10) -> str:
+        """Полоса прогресса: показывает наполненность нормы одним взглядом."""
+        if not target or target <= 0:
+            return "▫️" * width
+        share = max(0.0, min(current / target, 1.0))
+        filled = int(round(share * width))
+        overflow = current > target * 1.05
+        symbol = "🟧" if overflow else "🟩"
+        return symbol * filled + "▫️" * (width - filled)
+
     def format_daily_dashboard(self, stats: Dict) -> str:
         """
         Форматирует дневной дашборд для отправки пользователю.
         """
         if not stats:
-            return "📊 Статистика пока недоступна. Добавьте записи в дневник!"
-        
-        # Эмодзи для статусов
+            return "📊 Пока нечего показать — добавьте первую запись в дневник."
+
         protein_emoji = get_status_emoji(stats["protein_status"])
         carbs_emoji = get_status_emoji(stats["carbs_status"])
         fats_emoji = get_status_emoji(stats["fats_status"])
-        
-        # Остаток калорий
-        remaining = stats["calories_remaining"]
-        if remaining > 0:
-            calories_status = f"До цели осталось: **{remaining}** ккал"
-        elif remaining < -100:
-            calories_status = f"⚠️ Перебор на **{abs(remaining)}** ккал"
-        else:
-            calories_status = "🎯 Цель достигнута!"
-        
-        # Процент от цели
-        calories_percent = round(stats["calories"] / stats["target_calories"] * 100) if stats["target_calories"] else 0
-        
-        dashboard = f"""📊 **Статистика за сегодня**
 
-🔥 **Калории:** {stats["calories"]} / {stats["target_calories"]} ккал ({calories_percent}%)
+        remaining = stats["calories_remaining"]
+        if remaining > 100:
+            calories_status = f"Осталось на сегодня: *{remaining}* ккал"
+        elif remaining < -100:
+            calories_status = f"⚠️ Перебор на *{abs(remaining)}* ккал — ничего страшного, бывает"
+        else:
+            calories_status = "🎯 Ровно в цель, отличный день!"
+
+        calories_percent = round(stats["calories"] / stats["target_calories"] * 100) if stats["target_calories"] else 0
+        bar = self._progress_bar(stats["calories"], stats["target_calories"])
+
+        meals = stats.get("by_meal") or {}
+        meals_line = ""
+        if meals:
+            parts = [f"{label} {value} ккал" for label, value in meals.items()]
+            meals_line = "\n\n🍽 " + " · ".join(parts)
+
+        entries_word = self._plural(stats["entries_count"], "запись", "записи", "записей")
+
+        dashboard = f"""📊 *Сегодня*
+
+{bar}  {calories_percent}%
+🔥 {stats["calories"]} из {stats["target_calories"]} ккал
 {calories_status}
 
-**Нутриенты:**
-{protein_emoji} Белок: {stats["protein"]}г / {stats["target_protein"]}г — {stats["protein_status"]}
-{carbs_emoji} Углеводы: {stats["carbs"]}г / {stats["target_carbs"]}г — {stats["carbs_status"]}
-{fats_emoji} Жиры: {stats["fats"]}г / {stats["target_fats"]}г
+*Нутриенты*
+{protein_emoji} Белок: {stats["protein"]} / {stats["target_protein"]} г — {stats["protein_status"]}
+{carbs_emoji} Углеводы: {stats["carbs"]} / {stats["target_carbs"]} г — {stats["carbs_status"]}
+{fats_emoji} Жиры: {stats["fats"]} / {stats["target_fats"]} г — {stats["fats_status"]}{meals_line}
 
-📝 Записей за день: {stats["entries_count"]}"""
-        
+📝 {stats["entries_count"]} {entries_word} за день"""
+
         return dashboard
+
+    @staticmethod
+    def _plural(number: int, one: str, few: str, many: str) -> str:
+        """Согласовать существительное с числом: 1 запись, 2 записи, 5 записей."""
+        n = abs(number) % 100
+        if 11 <= n <= 14:
+            return many
+        n %= 10
+        if n == 1:
+            return one
+        if 2 <= n <= 4:
+            return few
+        return many
     
     def get_deficit_info(self, stats: Dict) -> Optional[Dict]:
         """
@@ -342,29 +384,55 @@ class StatisticsService:
         return None
 
 
-# Готовые варианты перекусов для рекомендаций
+# Готовые варианты перекусов для рекомендаций.
+# Поле `contains` перечисляет состав для проверки на аллергены: по названию
+# продукта его определить нельзя (протеиновый коктейль — молочный белок).
 SNACK_OPTIONS = {
     "protein": [
-        {"name": "Творог 5%", "portion": "150г", "protein": 25, "calories": 150, "carbs": 5, "fats": 7},
-        {"name": "Куриная грудка варёная", "portion": "100г", "protein": 30, "calories": 165, "carbs": 0, "fats": 3},
-        {"name": "Яйца варёные", "portion": "2 шт", "protein": 13, "calories": 155, "carbs": 1, "fats": 11},
-        {"name": "Греческий йогурт", "portion": "200г", "protein": 20, "calories": 130, "carbs": 8, "fats": 3},
-        {"name": "Тунец консервированный", "portion": "100г", "protein": 26, "calories": 130, "carbs": 0, "fats": 1},
-        {"name": "Протеиновый коктейль", "portion": "1 порция", "protein": 25, "calories": 120, "carbs": 3, "fats": 1},
-        {"name": "Сыр нежирный", "portion": "50г", "protein": 12, "calories": 100, "carbs": 1, "fats": 5},
+        {"name": "Творог 5%", "portion": "150г", "protein": 25, "calories": 150, "carbs": 5, "fats": 7,
+         "contains": ["молоко"]},
+        {"name": "Куриная грудка варёная", "portion": "100г", "protein": 30, "calories": 165, "carbs": 0, "fats": 3,
+         "contains": ["курица", "мясо"]},
+        {"name": "Яйца варёные", "portion": "2 шт", "protein": 13, "calories": 155, "carbs": 1, "fats": 11,
+         "contains": ["яйцо"]},
+        {"name": "Греческий йогурт", "portion": "200г", "protein": 20, "calories": 130, "carbs": 8, "fats": 3,
+         "contains": ["молоко"]},
+        {"name": "Тунец консервированный", "portion": "100г", "protein": 26, "calories": 130, "carbs": 0, "fats": 1,
+         "contains": ["рыба"]},
+        {"name": "Протеиновый коктейль", "portion": "1 порция", "protein": 25, "calories": 120, "carbs": 3, "fats": 1,
+         "contains": ["молоко", "сыворотка"]},
+        {"name": "Сыр нежирный", "portion": "50г", "protein": 12, "calories": 100, "carbs": 1, "fats": 5,
+         "contains": ["молоко"]},
+        {"name": "Нут отварной", "portion": "150г", "protein": 13, "calories": 180, "carbs": 27, "fats": 3,
+         "contains": []},
+        {"name": "Тофу", "portion": "150г", "protein": 12, "calories": 115, "carbs": 3, "fats": 7,
+         "contains": ["соя"]},
     ],
     "carbs": [
-        {"name": "Банан", "portion": "1 средний", "protein": 1, "calories": 105, "carbs": 27, "fats": 0},
-        {"name": "Овсянка на воде", "portion": "150г готовой", "protein": 4, "calories": 130, "carbs": 25, "fats": 2},
-        {"name": "Хлебцы цельнозерновые", "portion": "4 шт", "protein": 3, "calories": 100, "carbs": 20, "fats": 1},
-        {"name": "Рисовая каша", "portion": "150г", "protein": 3, "calories": 140, "carbs": 30, "fats": 1},
-        {"name": "Яблоко + мёд", "portion": "1 шт + 1 ч.л.", "protein": 0, "calories": 120, "carbs": 30, "fats": 0},
+        {"name": "Банан", "portion": "1 средний", "protein": 1, "calories": 105, "carbs": 27, "fats": 0,
+         "contains": []},
+        {"name": "Овсянка на воде", "portion": "150г готовой", "protein": 4, "calories": 130, "carbs": 25, "fats": 2,
+         "contains": ["овсянка", "глютен"]},
+        {"name": "Хлебцы цельнозерновые", "portion": "4 шт", "protein": 3, "calories": 100, "carbs": 20, "fats": 1,
+         "contains": ["глютен"]},
+        {"name": "Рисовая каша", "portion": "150г", "protein": 3, "calories": 140, "carbs": 30, "fats": 1,
+         "contains": []},
+        {"name": "Яблоко с мёдом", "portion": "1 шт + 1 ч.л.", "protein": 0, "calories": 120, "carbs": 30, "fats": 0,
+         "contains": ["мёд"]},
+        {"name": "Печёный картофель", "portion": "150г", "protein": 3, "calories": 130, "carbs": 29, "fats": 0,
+         "contains": []},
     ],
     "fats": [
-        {"name": "Авокадо", "portion": "половинка", "protein": 2, "calories": 160, "carbs": 8, "fats": 15},
-        {"name": "Орехи микс", "portion": "30г", "protein": 5, "calories": 180, "carbs": 5, "fats": 16},
-        {"name": "Оливковое масло", "portion": "1 ст.л.", "protein": 0, "calories": 120, "carbs": 0, "fats": 14},
-        {"name": "Лосось слабосолёный", "portion": "50г", "protein": 10, "calories": 100, "carbs": 0, "fats": 6},
+        {"name": "Авокадо", "portion": "половинка", "protein": 2, "calories": 160, "carbs": 8, "fats": 15,
+         "contains": []},
+        {"name": "Орехи микс", "portion": "30г", "protein": 5, "calories": 180, "carbs": 5, "fats": 16,
+         "contains": ["орехи"]},
+        {"name": "Оливковое масло", "portion": "1 ст.л.", "protein": 0, "calories": 120, "carbs": 0, "fats": 14,
+         "contains": []},
+        {"name": "Лосось слабосолёный", "portion": "50г", "protein": 10, "calories": 100, "carbs": 0, "fats": 6,
+         "contains": ["рыба"]},
+        {"name": "Семена тыквы", "portion": "25г", "protein": 7, "calories": 145, "carbs": 4, "fats": 12,
+         "contains": []},
     ]
 }
 
@@ -374,62 +442,38 @@ def get_snack_recommendations(
     deficit_amount: float,
     calories_remaining: int,
     allergies: List[str] = None,
-    count: int = 3
+    count: int = 3,
+    dietary_preferences: List[str] = None
 ) -> List[Dict]:
     """
     Подбирает варианты перекусов для закрытия дефицита.
-    
-    Args:
-        deficit_type: Тип дефицита (protein, carbs, fats)
-        deficit_amount: Сколько нужно добрать
-        calories_remaining: Сколько калорий осталось
-        allergies: Список аллергий для фильтрации
-        count: Сколько вариантов вернуть
-    
-    Returns:
-        Список рекомендованных перекусов
+
+    Отбор идёт по составу продукта, а не по совпадению слов в названии:
+    «Протеиновый коктейль» — сывороточный, то есть молочный белок, и человеку
+    с аллергией на молоко он не подходит, хотя слова «молоко» в названии нет.
     """
     snacks = SNACK_OPTIONS.get(deficit_type, [])
-    allergies = allergies or []
-    
-    # Фильтруем по калориям и аллергиям
+
     suitable = []
     for snack in snacks:
-        # Проверяем калории
         if snack["calories"] > calories_remaining + 50:
             continue
-        
-        # Проверяем аллергии (простая проверка по ключевым словам)
-        snack_lower = snack["name"].lower()
-        has_allergen = False
-        for allergen in allergies:
-            allergen_lower = allergen.lower()
-            if allergen_lower in snack_lower:
-                has_allergen = True
+
+        # Проверяем и явный состав, и название — на случай, если продукт
+        # добавили в справочник без разметки состава.
+        conflict = None
+        for candidate in [snack["name"], *snack.get("contains", [])]:
+            conflict = product_conflicts(candidate, allergies, dietary_preferences)
+            if conflict:
                 break
-            # Дополнительные проверки
-            if "молок" in allergen_lower or "лактоз" in allergen_lower:
-                if any(word in snack_lower for word in ["творог", "йогурт", "сыр", "молок"]):
-                    has_allergen = True
-                    break
-            if "яйц" in allergen_lower and "яйц" in snack_lower:
-                has_allergen = True
-                break
-            if "орех" in allergen_lower and "орех" in snack_lower:
-                has_allergen = True
-                break
-            if "рыб" in allergen_lower:
-                if any(word in snack_lower for word in ["тунец", "лосось", "рыб"]):
-                    has_allergen = True
-                    break
-        
-        if not has_allergen:
+
+        if not conflict:
             suitable.append(snack)
-    
+
     # Сортируем по эффективности (сколько нутриента на калорию)
     nutrient_key = deficit_type if deficit_type != "protein" else "protein"
     suitable.sort(key=lambda x: x.get(nutrient_key, 0) / max(x["calories"], 1), reverse=True)
-    
+
     return suitable[:count]
 
 
@@ -438,27 +482,32 @@ def format_snack_recommendations(snacks: List[Dict], deficit_name: str) -> str:
     Форматирует рекомендации перекусов для пользователя.
     """
     if not snacks:
-        return f"К сожалению, не удалось подобрать варианты для добора {deficit_name} с учётом ваших ограничений."
-    
-    text = f"🍽 **Если хочешь добить {deficit_name}, вот варианты:**\n\n"
-    
-    for i, snack in enumerate(snacks, 1):
+        return (
+            f"Подходящих вариантов для добора {deficit_name} не нашлось — "
+            "всё из моего списка не подходит под ваши ограничения или не влезает "
+            "в остаток калорий."
+        )
+
+    text = f"🍽 *Чем добрать {deficit_name}*\n\n"
+
+    for snack in snacks:
         nutrient_info = []
         if snack.get("protein", 0) > 5:
-            nutrient_info.append(f"🥩 {snack['protein']}г белка")
+            nutrient_info.append(f"🥩 {snack['protein']} г белка")
         if snack.get("carbs", 0) > 10:
-            nutrient_info.append(f"🍞 {snack['carbs']}г углеводов")
+            nutrient_info.append(f"🍞 {snack['carbs']} г углеводов")
         if snack.get("fats", 0) > 5:
-            nutrient_info.append(f"🧈 {snack['fats']}г жиров")
-        
-        nutrients = " | ".join(nutrient_info) if nutrient_info else ""
-        
-        text += f"{i}. **{snack['name']}** ({snack['portion']})\n"
-        text += f"   🔥 {snack['calories']} ккал"
+            nutrient_info.append(f"🧈 {snack['fats']} г жиров")
+
+        nutrients = " · ".join(nutrient_info)
+
+        text += f"• *{snack['name']}* — {snack['portion']}\n"
+        text += f"  🔥 {snack['calories']} ккал"
         if nutrients:
-            text += f" — {nutrients}"
+            text += f" · {nutrients}"
         text += "\n\n"
-    
+
+    text += "_Съели что-то из этого — просто напишите мне, я запишу._"
     return text
 
 

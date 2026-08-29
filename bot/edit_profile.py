@@ -91,27 +91,38 @@ async def start_edit_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     from bot.handlers import get_main_keyboard
     
+    from bot.conversation import MIN_AGE, MAX_AGE
+
     await query.message.reply_text(
-        "👤 **Редактирование возраста**\n\n"
-        "Введите ваш возраст (от 10 до 100 лет):\n\n"
-        "💡 Или /cancel для отмены",
+        "👤 *Возраст*\n\n"
+        f"Сколько вам полных лет? (от {MIN_AGE} до {MAX_AGE})\n\n"
+        "_Отменить: /cancel_",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard()
     )
-    
+
     return EDIT_AGE
 
 
 async def save_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохранить новый возраст"""
     user = update.effective_user
-    
+    from bot.conversation import MIN_AGE, MAX_AGE
+
     try:
         age = int(update.message.text)
-        if age < 10 or age > 100:
-            await update.message.reply_text("❌ Возраст должен быть от 10 до 100 лет")
+        if age < MIN_AGE:
+            # Тот же порог, что и при регистрации: нормы для подростков
+            # считаются иначе и требуют участия врача.
+            await update.message.reply_text(
+                f"Я рассчитываю нормы только для взрослых — с {MIN_AGE} лет.\n\n"
+                "Профиль оставил без изменений."
+            )
             return EDIT_AGE
-        
+        if age > MAX_AGE:
+            await update.message.reply_text(f"Проверьте возраст — я ожидаю значение до {MAX_AGE} лет.")
+            return EDIT_AGE
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(User).where(User.telegram_id == user.id)
@@ -121,15 +132,15 @@ async def save_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if db_user:
                 db_user.age = age
                 await session.commit()
-                await update.message.reply_text(f"✅ Возраст обновлен: {age} лет")
+                await update.message.reply_text(f"✅ Возраст: {age} лет")
                 
                 # Пересчитываем целевые показатели
-                await recalculate_targets(db_user, session)
+                await recalculate_targets(db_user, session, update.message)
         
         return await show_edit_menu(update, context)
         
     except ValueError:
-        await update.message.reply_text("❌ Введите число (например: 25)")
+        await update.message.reply_text("Нужно число — например: 28")
         return EDIT_AGE
 
 
@@ -163,7 +174,7 @@ async def save_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "Жен" in gender_text:
         gender = "female"
     else:
-        await update.message.reply_text("❌ Используйте кнопки")
+        await update.message.reply_text("Выберите вариант кнопкой ниже.")
         return EDIT_GENDER
     
     async with AsyncSessionLocal() as session:
@@ -176,10 +187,10 @@ async def save_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_user.gender = gender
             await session.commit()
             gender_name = "Мужской" if gender == "male" else "Женский"
-            await update.message.reply_text(f"✅ Пол обновлен: {gender_name}")
+            await update.message.reply_text(f"✅ Пол: {gender_name}")
             
             # Пересчитываем целевые показатели
-            await recalculate_targets(db_user, session)
+            await recalculate_targets(db_user, session, update.message)
     
     return await show_edit_menu(update, context)
 
@@ -209,7 +220,7 @@ async def save_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         weight = float(update.message.text.replace(',', '.'))
         if weight < 30 or weight > 300:
-            await update.message.reply_text("❌ Вес должен быть от 30 до 300 кг")
+            await update.message.reply_text("Проверьте вес — я ожидаю значение от 30 до 300 кг.")
             return EDIT_WEIGHT
         
         async with AsyncSessionLocal() as session:
@@ -221,15 +232,15 @@ async def save_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if db_user:
                 db_user.weight = weight
                 await session.commit()
-                await update.message.reply_text(f"✅ Вес обновлен: {weight} кг")
+                await update.message.reply_text(f"✅ Вес: {weight} кг")
                 
                 # Пересчитываем целевые показатели
-                await recalculate_targets(db_user, session)
+                await recalculate_targets(db_user, session, update.message)
         
         return await show_edit_menu(update, context)
         
     except ValueError:
-        await update.message.reply_text("❌ Введите число (например: 70 или 70.5)")
+        await update.message.reply_text("Нужно число — например: 72 или 72,5")
         return EDIT_WEIGHT
 
 
@@ -258,7 +269,7 @@ async def save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         height = float(update.message.text.replace(',', '.'))
         if height < 100 or height > 250:
-            await update.message.reply_text("❌ Рост должен быть от 100 до 250 см")
+            await update.message.reply_text("Проверьте рост — я ожидаю значение от 100 до 250 см.")
             return EDIT_HEIGHT
         
         async with AsyncSessionLocal() as session:
@@ -270,15 +281,15 @@ async def save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if db_user:
                 db_user.height = height
                 await session.commit()
-                await update.message.reply_text(f"✅ Рост обновлен: {height} см")
+                await update.message.reply_text(f"✅ Рост: {height} см")
                 
                 # Пересчитываем целевые показатели
-                await recalculate_targets(db_user, session)
+                await recalculate_targets(db_user, session, update.message)
         
         return await show_edit_menu(update, context)
         
     except ValueError:
-        await update.message.reply_text("❌ Введите число (например: 175)")
+        await update.message.reply_text("Нужно число в сантиметрах — например: 175")
         return EDIT_HEIGHT
 
 
@@ -319,7 +330,7 @@ async def save_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         goal = "gain_weight"
         goal_name = "Набор массы"
     else:
-        await update.message.reply_text("❌ Используйте кнопки")
+        await update.message.reply_text("Выберите вариант кнопкой ниже.")
         return EDIT_GOAL
     
     async with AsyncSessionLocal() as session:
@@ -331,10 +342,10 @@ async def save_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if db_user:
             db_user.goal = goal
             await session.commit()
-            await update.message.reply_text(f"✅ Цель обновлена: {goal_name}")
+            await update.message.reply_text(f"✅ Цель: {goal_name}")
             
             # Пересчитываем целевые показатели
-            await recalculate_targets(db_user, session)
+            await recalculate_targets(db_user, session, update.message)
     
     return await show_edit_menu(update, context)
 
@@ -384,7 +395,7 @@ async def save_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         activity = "very_active"
         activity_name = "Очень высокая"
     else:
-        await update.message.reply_text("❌ Используйте кнопки")
+        await update.message.reply_text("Выберите вариант кнопкой ниже.")
         return EDIT_ACTIVITY
     
     async with AsyncSessionLocal() as session:
@@ -396,37 +407,55 @@ async def save_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if db_user:
             db_user.activity_level = activity
             await session.commit()
-            await update.message.reply_text(f"✅ Уровень активности обновлен: {activity_name}")
+            await update.message.reply_text(f"✅ Активность: {activity_name}")
             
             # Пересчитываем целевые показатели
-            await recalculate_targets(db_user, session)
+            await recalculate_targets(db_user, session, update.message)
     
     return await show_edit_menu(update, context)
 
 
-async def recalculate_targets(db_user, session):
-    """Пересчитать целевые показатели после изменения данных"""
-    if all([db_user.age, db_user.weight, db_user.height, db_user.gender, db_user.activity_level, db_user.goal]):
-        from services import AIService
-        ai_service = AIService()
-        
-        calorie_data = await ai_service.calculate_daily_calories(
-            weight=db_user.weight,
-            height=db_user.height,
-            age=db_user.age,
-            gender=db_user.gender,
-            activity_level=db_user.activity_level,
-            goal=db_user.goal
+async def recalculate_targets(db_user, session, message=None):
+    """
+    Пересчитать целевые показатели после изменения данных.
+
+    Если расчёт упёрся в безопасный минимум, сообщаем об этом пользователю —
+    иначе новая цифра выглядит как ошибка бота.
+    """
+    if not all([db_user.age, db_user.weight, db_user.height, db_user.gender,
+                db_user.activity_level, db_user.goal]):
+        return
+
+    from services import AIService
+    ai_service = AIService()
+
+    calorie_data = await ai_service.calculate_daily_calories(
+        weight=db_user.weight,
+        height=db_user.height,
+        age=db_user.age,
+        gender=db_user.gender,
+        activity_level=db_user.activity_level,
+        goal=db_user.goal
+    )
+
+    db_user.target_calories = calorie_data['calories']
+    db_user.target_protein = calorie_data['protein']
+    db_user.target_fats = calorie_data['fats']
+    db_user.target_carbs = calorie_data['carbs']
+
+    await session.commit()
+    logger.info(f"Recalculated targets for user {db_user.telegram_id}")
+
+    if message is not None:
+        from bot.handlers import format_target_warnings, safe_reply
+        warnings = format_target_warnings(calorie_data.get("warnings", []))
+        await safe_reply(
+            message,
+            f"🎯 Новая норма: *{calorie_data['calories']}* ккал в день\n"
+            f"Б {calorie_data['protein']} · Ж {calorie_data['fats']} · У {calorie_data['carbs']}"
+            + warnings,
+            parse_mode="Markdown"
         )
-        
-        db_user.target_calories = calorie_data['calories']
-        db_user.target_protein = calorie_data['protein']
-        db_user.target_fats = calorie_data['fats']
-        db_user.target_carbs = calorie_data['carbs']
-        
-        await session.commit()
-        
-        logger.info(f"Recalculated targets for user {db_user.telegram_id}")
 
 
 async def finish_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,12 +476,12 @@ async def cancel_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if update.callback_query:
         await update.callback_query.message.reply_text(
-            "Редактирование отменено",
+            "Хорошо, оставил всё как было.",
             reply_markup=get_main_keyboard()
         )
     else:
         await update.message.reply_text(
-            "Редактирование отменено",
+            "Хорошо, оставил всё как было.",
             reply_markup=get_main_keyboard()
         )
     

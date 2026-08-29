@@ -229,7 +229,8 @@ class ReminderService:
                         "protein",
                         stats["target_protein"] - stats["protein"],
                         stats["calories_remaining"],
-                        stats.get("user_allergies", [])
+                        stats.get("user_allergies", []),
+                        dietary_preferences=stats.get("user_preferences", [])
                     )
                     
                     if snacks:
@@ -264,7 +265,8 @@ class ReminderService:
                     "protein",
                     stats["target_protein"] - stats["protein"],
                     stats["calories_remaining"],
-                    stats.get("user_allergies", [])
+                    stats.get("user_allergies", []),
+                    dietary_preferences=stats.get("user_preferences", [])
                 )
                 
                 if snacks:
