@@ -23,7 +23,11 @@ from bot.handlers import (
     my_recipes_command,
     handle_recipe_search,
     button_callback,
-    handle_photo_lazy_mode
+    handle_photo_lazy_mode,
+    handle_voice_message,
+    handle_location_message,
+    timezone_command,
+    repeat_command,
 )
 from services.scheduler_service import scheduler_service
 import logging
@@ -130,6 +134,8 @@ def setup_bot() -> Application:
     application.add_handler(CommandHandler("statistics", statistics_command))
     application.add_handler(CommandHandler("goals", goals_command))
     application.add_handler(CommandHandler("saved", my_recipes_command))
+    application.add_handler(CommandHandler("timezone", timezone_command))
+    application.add_handler(CommandHandler("repeat", repeat_command))
     
     # Обработчик callback кнопок
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -147,6 +153,22 @@ def setup_bot() -> Application:
         MessageHandler(
             filters.PHOTO,
             handle_photo_lazy_mode
+        )
+    )
+
+    # Голосовые и аудио: расшифровка → тот же маршрут, что и у текста
+    application.add_handler(
+        MessageHandler(
+            filters.VOICE | filters.AUDIO,
+            handle_voice_message
+        )
+    )
+
+    # Геопозиция — только для определения часового пояса
+    application.add_handler(
+        MessageHandler(
+            filters.LOCATION,
+            handle_location_message
         )
     )
     
@@ -173,9 +195,11 @@ async def start_bot():
             BotCommand("start", "Начало и настройка профиля"),
             BotCommand("stats", "Итоги дня"),
             BotCommand("diary", "Дневник питания"),
+            BotCommand("repeat", "Повторить недавнее"),
             BotCommand("recipes", "Подобрать рецепт"),
             BotCommand("saved", "Сохранённые рецепты"),
             BotCommand("goals", "Цели по КБЖУ"),
+            BotCommand("timezone", "Часовой пояс"),
             BotCommand("profile", "Профиль"),
             BotCommand("help", "Как пользоваться"),
         ])

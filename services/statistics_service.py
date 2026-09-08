@@ -9,6 +9,8 @@ from database.models import User, DiaryEntry
 from database.database import AsyncSessionLocal
 from utils.allergens import product_conflicts
 from utils.telegram_ui import meal_label
+from utils.timeutil import get_zone, local_today, local_day_bounds, local_range_bounds, to_local
+from utils.water import WATER_MEAL_TYPE, water_target_ml, format_litres
 import logging
 
 logger = logging.getLogger(__name__)
@@ -24,20 +26,20 @@ class NutrientStatus:
 def evaluate_nutrient(current: float, target: float, nutrient_type: str = "default") -> str:
     """
     Оценивает статус нутриента относительно цели.
-    
+
     Args:
         current: Текущее потребление
         target: Целевое значение
         nutrient_type: Тип нутриента (protein, carbs, fats, calories)
-    
+
     Returns:
         Строка оценки: "мало", "норм", "много"
     """
     if target <= 0:
         return NutrientStatus.NORMAL
-    
+
     ratio = current / target
-    
+
     # Для белка строже - важно набрать норму
     if nutrient_type == "protein":
         if ratio < 0.7:
@@ -45,7 +47,7 @@ def evaluate_nutrient(current: float, target: float, nutrient_type: str = "defau
         elif ratio > 1.2:
             return NutrientStatus.HIGH
         return NutrientStatus.NORMAL
-    
+
     # Для углеводов средние границы
     elif nutrient_type == "carbs":
         if ratio < 0.6:
@@ -53,7 +55,7 @@ def evaluate_nutrient(current: float, target: float, nutrient_type: str = "defau
         elif ratio > 1.3:
             return NutrientStatus.HIGH
         return NutrientStatus.NORMAL
-    
+
     # Для жиров - следим за перебором
     elif nutrient_type == "fats":
         if ratio < 0.5:
@@ -61,7 +63,7 @@ def evaluate_nutrient(current: float, target: float, nutrient_type: str = "defau
         elif ratio > 1.2:
             return NutrientStatus.HIGH
         return NutrientStatus.NORMAL
-    
+
     # Общий случай
     else:
         if ratio < 0.7:
@@ -83,15 +85,15 @@ def get_status_emoji(status: str) -> str:
 
 class StatisticsService:
     """Сервис для работы со статистикой питания"""
-    
+
     async def get_daily_stats(
-        self, 
-        telegram_id: int, 
+        self,
+        telegram_id: int,
         target_date: Optional[date] = None
     ) -> Optional[Dict]:
         """
         Получить статистику за день.
-        
+
         Returns:
             Dict с полями:
             - calories, protein, fats, carbs (текущие)
@@ -101,49 +103,53 @@ class StatisticsService:
             - entries_count (количество записей)
             - entries (список записей)
         """
-        if target_date is None:
-            target_date = date.today()
-        
-        start_datetime = datetime.combine(target_date, datetime.min.time())
-        end_datetime = datetime.combine(target_date, datetime.max.time())
-        
         async with AsyncSessionLocal() as session:
             # Получаем пользователя
             result = await session.execute(
                 select(User).where(User.telegram_id == telegram_id)
             )
             user = result.scalar_one_or_none()
-            
+
             if not user:
                 return None
-            
-            # Получаем записи за день
+
+            # День считаем во времени пользователя, а не сервера: ужин в 01:00
+            # по Москве раньше попадал во «вчера», потому что сервер живёт в UTC.
+            zone = get_zone(user.timezone)
+            if target_date is None:
+                target_date = local_today(zone)
+            start_datetime, end_datetime = local_day_bounds(zone, target_date)
+
             result = await session.execute(
                 select(DiaryEntry)
                 .where(DiaryEntry.user_id == user.id)
                 .where(DiaryEntry.date >= start_datetime)
-                .where(DiaryEntry.date <= end_datetime)
+                .where(DiaryEntry.date < end_datetime)
                 .order_by(DiaryEntry.date)
             )
-            entries = result.scalars().all()
-            
+            all_entries = result.scalars().all()
+
+            # Вода учитывается отдельно и в еду не входит.
+            water_ml = sum((e.portion_size or 0) for e in all_entries if e.meal_type == WATER_MEAL_TYPE)
+            entries = [e for e in all_entries if e.meal_type != WATER_MEAL_TYPE]
+
             # Подсчитываем итоги
             total_calories = sum(e.calories or 0 for e in entries)
             total_protein = sum(e.protein or 0 for e in entries)
             total_fats = sum(e.fats or 0 for e in entries)
             total_carbs = sum(e.carbs or 0 for e in entries)
-            
+
             # Целевые значения
             target_calories = user.target_calories or 2000
             target_protein = user.target_protein or 100
             target_fats = user.target_fats or 65
             target_carbs = user.target_carbs or 250
-            
+
             # Оценки
             protein_status = evaluate_nutrient(total_protein, target_protein, "protein")
             carbs_status = evaluate_nutrient(total_carbs, target_carbs, "carbs")
             fats_status = evaluate_nutrient(total_fats, target_fats, "fats")
-            
+
             # Остаток калорий
             calories_remaining = target_calories - total_calories
 
@@ -160,73 +166,75 @@ class StatisticsService:
                 "protein": round(total_protein, 1),
                 "fats": round(total_fats, 1),
                 "carbs": round(total_carbs, 1),
-                
+
                 # Целевые показатели
                 "target_calories": target_calories,
                 "target_protein": round(target_protein, 1),
                 "target_fats": round(target_fats, 1),
                 "target_carbs": round(target_carbs, 1),
-                
+
                 # Оценки
                 "protein_status": protein_status,
                 "carbs_status": carbs_status,
                 "fats_status": fats_status,
-                
+
                 # Дополнительно
                 "calories_remaining": round(calories_remaining),
                 "entries_count": len(entries),
                 "by_meal": by_meal,
+                "water_ml": round(water_ml),
+                "water_target_ml": water_target_ml(user.weight),
+                "date": target_date.isoformat(),
+                "timezone": user.timezone,
                 "entries": [
                     {
                         "id": e.id,
-                        "time": e.date.strftime("%H:%M"),
+                        "time": to_local(e.date, zone).strftime("%H:%M"),
                         "food_name": e.food_name,
                         "meal_type": e.meal_type,
                         "calories": e.calories
                     }
                     for e in entries
                 ],
-                
+
                 # Данные пользователя для рекомендаций
                 "user_allergies": user.allergies or [],
                 "user_preferences": user.dietary_preferences or [],
                 "user_goal": user.goal
             }
-    
+
     async def get_weekly_stats(self, telegram_id: int) -> Optional[Dict]:
         """
         Получить статистику за неделю.
         """
-        today = date.today()
-        week_start = today - timedelta(days=7)
-        
-        start_datetime = datetime.combine(week_start, datetime.min.time())
-        end_datetime = datetime.combine(today, datetime.max.time())
-        
         async with AsyncSessionLocal() as session:
             # Получаем пользователя
             result = await session.execute(
                 select(User).where(User.telegram_id == telegram_id)
             )
             user = result.scalar_one_or_none()
-            
+
             if not user:
                 return None
-            
-            # Получаем записи за неделю
+
+            zone = get_zone(user.timezone)
+            today = local_today(zone)
+            week_start = today - timedelta(days=6)  # семь дней вместе с сегодняшним
+            start_datetime, end_datetime = local_range_bounds(zone, week_start, today)
+
             result = await session.execute(
                 select(DiaryEntry)
                 .where(DiaryEntry.user_id == user.id)
                 .where(DiaryEntry.date >= start_datetime)
-                .where(DiaryEntry.date <= end_datetime)
+                .where(DiaryEntry.date < end_datetime)
                 .order_by(DiaryEntry.date)
             )
-            entries = result.scalars().all()
-            
+            entries = [e for e in result.scalars().all() if e.meal_type != WATER_MEAL_TYPE]
+
             # Группируем по дням
             days_data = {}
             for entry in entries:
-                day_key = entry.date.date()
+                day_key = to_local(entry.date, zone).date()
                 if day_key not in days_data:
                     days_data[day_key] = {
                         "calories": 0,
@@ -240,14 +248,14 @@ class StatisticsService:
                 days_data[day_key]["fats"] += entry.fats or 0
                 days_data[day_key]["carbs"] += entry.carbs or 0
                 days_data[day_key]["entries_count"] += 1
-            
+
             # Средние значения
             days_count = len(days_data) or 1
             avg_calories = sum(d["calories"] for d in days_data.values()) / days_count
             avg_protein = sum(d["protein"] for d in days_data.values()) / days_count
             avg_fats = sum(d["fats"] for d in days_data.values()) / days_count
             avg_carbs = sum(d["carbs"] for d in days_data.values()) / days_count
-            
+
             return {
                 "days_tracked": len(days_data),
                 "avg_calories": round(avg_calories),
@@ -259,7 +267,7 @@ class StatisticsService:
                     str(k): v for k, v in days_data.items()
                 }
             }
-    
+
     @staticmethod
     def _progress_bar(current: float, target: float, width: int = 10) -> str:
         """Полоса прогресса: показывает наполненность нормы одним взглядом."""
@@ -301,6 +309,12 @@ class StatisticsService:
 
         entries_word = self._plural(stats["entries_count"], "запись", "записи", "записей")
 
+        water_line = ""
+        water_ml = stats.get("water_ml") or 0
+        if water_ml:
+            water_line = (f"\n💧 Вода: {format_litres(water_ml)} из "
+                          f"{format_litres(stats.get('water_target_ml') or 2000)} л")
+
         dashboard = f"""📊 *Сегодня*
 
 {bar}  {calories_percent}%
@@ -310,7 +324,7 @@ class StatisticsService:
 *Нутриенты*
 {protein_emoji} Белок: {stats["protein"]} / {stats["target_protein"]} г — {stats["protein_status"]}
 {carbs_emoji} Углеводы: {stats["carbs"]} / {stats["target_carbs"]} г — {stats["carbs_status"]}
-{fats_emoji} Жиры: {stats["fats"]} / {stats["target_fats"]} г — {stats["fats_status"]}{meals_line}
+{fats_emoji} Жиры: {stats["fats"]} / {stats["target_fats"]} г — {stats["fats_status"]}{meals_line}{water_line}
 
 📝 {stats["entries_count"]} {entries_word} за день"""
 
@@ -328,19 +342,19 @@ class StatisticsService:
         if 2 <= n <= 4:
             return few
         return many
-    
+
     def get_deficit_info(self, stats: Dict) -> Optional[Dict]:
         """
         Определяет дефициты нутриентов для рекомендаций.
-        
+
         Returns:
             Dict с информацией о дефицитах или None если всё в норме
         """
         if not stats:
             return None
-        
+
         deficits = {}
-        
+
         # Проверяем белок
         if stats["protein_status"] == NutrientStatus.LOW:
             protein_deficit = stats["target_protein"] - stats["protein"]
@@ -350,7 +364,7 @@ class StatisticsService:
                 "deficit": round(protein_deficit, 1),
                 "name": "белок"
             }
-        
+
         # Проверяем углеводы
         if stats["carbs_status"] == NutrientStatus.LOW:
             carbs_deficit = stats["target_carbs"] - stats["carbs"]
@@ -360,7 +374,7 @@ class StatisticsService:
                 "deficit": round(carbs_deficit, 1),
                 "name": "углеводы"
             }
-        
+
         # Проверяем жиры
         if stats["fats_status"] == NutrientStatus.LOW:
             fats_deficit = stats["target_fats"] - stats["fats"]
@@ -370,17 +384,17 @@ class StatisticsService:
                 "deficit": round(fats_deficit, 1),
                 "name": "жиры"
             }
-        
+
         # Остаток калорий
         calories_remaining = stats["calories_remaining"]
-        
+
         if deficits and calories_remaining > 100:
             return {
                 "deficits": deficits,
                 "calories_remaining": calories_remaining,
                 "has_room_for_snack": True
             }
-        
+
         return None
 
 

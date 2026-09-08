@@ -91,6 +91,7 @@ class User(Base):
     morning_checkin_enabled = Column(Boolean, default=False)  # Утренний чек-ин
     morning_checkin_time = Column(String, default="08:00")  # Время чек-ина
     today_plan_mode = Column(String, nullable=True)  # "strict" / "relaxed" / None
+    plan_mode_date = Column(Date, nullable=True)  # день пользователя, к которому относится today_plan_mode
     
     # Метаданные
     created_at = Column(DateTime, default=datetime.utcnow)

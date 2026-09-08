@@ -444,6 +444,8 @@ CALORIE_CALCULATION_PROMPT = """Ты - эксперт по подсчету ка
 {
   "needs_clarification": true или false,
   "clarification_question": "вопрос на русском" или null,
+  "meal_type": "завтрак" / "обед" / "ужин" / "перекус" / null — если в тексте назван приём пищи,
+  "day_offset": 0 / -1 / -2 — 0 сегодня, -1 если сказано «вчера», -2 если «позавчера»,
   "items": [
     {
       "name": "название продукта",

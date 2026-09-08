@@ -396,6 +396,16 @@ class AIService:
             for key in ("calories", "protein", "fats", "carbs")
         }
 
+        meal_type = result.get("meal_type")
+        if meal_type not in ("завтрак", "обед", "ужин", "перекус"):
+            meal_type = None
+        try:
+            day_offset = int(result.get("day_offset") or 0)
+        except (TypeError, ValueError):
+            day_offset = 0
+        if day_offset > 0 or day_offset < -7:
+            day_offset = 0
+
         return {
             # Запрос на уточнение сохраняем как есть: модель может распознать
             # часть позиций и всё равно нуждаться в способе приготовления для
@@ -404,7 +414,83 @@ class AIService:
             "clarification_question": result.get("clarification_question"),
             "items": items,
             "total": total,
+            # Подсказки о времени приёма пищи — запасной путь, основной разбор
+            # делает utils.meal_context по словам самого сообщения.
+            "meal_type": meal_type,
+            "day_offset": day_offset,
         }
+
+    # Модели распознавания речи в порядке предпочтения: первая точнее и
+    # дешевле на русском, вторая — запасная.
+    TRANSCRIBE_MODELS = ("gpt-4o-mini-transcribe", "whisper-1")
+
+    async def transcribe_audio(self, audio_bytes: bytes, filename: str = "voice.ogg") -> str:
+        """
+        Распознать голосовое сообщение.
+
+        Telegram присылает голос в OGG/Opus; API принимает его напрямую. Если
+        формат всё же отклонён и в системе есть ffmpeg, перекодируем в mp3 и
+        повторяем. Пустая строка означает, что речи в записи не нашлось.
+        """
+        import io
+
+        hint = (
+            "Голосовая заметка о еде на русском языке: названия продуктов и блюд, "
+            "вес в граммах, объём в миллилитрах, «съел», «выпил», «на завтрак», «вчера»."
+        )
+
+        payload = audio_bytes
+        name = filename
+        converted = False
+        last_error: Optional[Exception] = None
+
+        for attempt in range(2):
+            for model in self.TRANSCRIBE_MODELS:
+                try:
+                    stream = io.BytesIO(payload)
+                    stream.name = name
+                    response = await self.client.audio.transcriptions.create(
+                        model=model,
+                        file=stream,
+                        language="ru",
+                        prompt=hint,
+                    )
+                    return (getattr(response, "text", "") or "").strip()
+                except Exception as e:  # noqa: BLE001 — пробуем следующую модель
+                    last_error = e
+                    logger.warning(f"Transcription with {model} failed: {e}")
+
+            if converted:
+                break
+            payload_mp3 = await self._convert_to_mp3(payload)
+            if not payload_mp3:
+                break
+            payload, name, converted = payload_mp3, "voice.mp3", True
+
+        raise AIServiceUnavailable(str(last_error) if last_error else "transcription failed")
+
+    @staticmethod
+    async def _convert_to_mp3(audio_bytes: bytes) -> Optional[bytes]:
+        """Перекодировать через ffmpeg, если он установлен; иначе None."""
+        import asyncio
+        import shutil
+        import subprocess
+
+        if not shutil.which("ffmpeg"):
+            return None
+
+        def run() -> Optional[bytes]:
+            result = subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-f", "mp3", "-ac", "1", "-ar", "16000", "pipe:1"],
+                input=audio_bytes, capture_output=True, timeout=60,
+            )
+            return result.stdout if result.returncode == 0 and result.stdout else None
+
+        try:
+            return await asyncio.to_thread(run)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"ffmpeg conversion failed: {e}")
+            return None
 
     async def analyze_food_photo(self, image_bytes: bytes, caption: str = "") -> Dict:
         """

@@ -38,6 +38,9 @@ python-json-logger==2.0.7
 # Utils
 python-dotenv==1.0.0
 pytz==2024.1
+tzdata==2024.1
+# Часовой пояс по геопозиции (необязательно: без библиотеки пояс оценивается по долготе)
+timezonefinder==6.5.2
 python-dateutil==2.8.2
 
 # Development

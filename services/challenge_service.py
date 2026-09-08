@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database.models import User, Challenge, DiaryEntry
 from database.database import AsyncSessionLocal
+from utils.timeutil import get_zone, local_today, local_day_bounds, to_local, utc_now
 import logging
 import random
 
@@ -53,14 +54,14 @@ CHALLENGE_TYPES = {
 
 class ChallengeService:
     """Сервис для управления челленджами"""
-    
+
     def get_available_challenges(self) -> List[Dict]:
         """Возвращает список доступных челленджей"""
         return [
-            {"type": k, **v} 
+            {"type": k, **v}
             for k, v in CHALLENGE_TYPES.items()
         ]
-    
+
     def get_random_challenge_suggestion(self) -> Dict:
         """Возвращает случайное предложение челленджа"""
         challenge_type = random.choice(list(CHALLENGE_TYPES.keys()))
@@ -68,30 +69,31 @@ class ChallengeService:
             "type": challenge_type,
             **CHALLENGE_TYPES[challenge_type]
         }
-    
+
     async def start_challenge(
-        self, 
-        telegram_id: int, 
+        self,
+        telegram_id: int,
         challenge_type: str
     ) -> Optional[Challenge]:
         """Начинает новый челлендж для пользователя"""
         if challenge_type not in CHALLENGE_TYPES:
             return None
-        
+
         challenge_info = CHALLENGE_TYPES[challenge_type]
-        today = date.today()
-        end_date = today + timedelta(days=challenge_info["duration"])
-        
+
         async with AsyncSessionLocal() as session:
             # Получаем пользователя
             result = await session.execute(
                 select(User).where(User.telegram_id == telegram_id)
             )
             user = result.scalar_one_or_none()
-            
+
             if not user:
                 return None
-            
+
+            today = local_today(get_zone(user.timezone))
+            end_date = today + timedelta(days=challenge_info["duration"])
+
             # Проверяем нет ли активного челленджа
             result = await session.execute(
                 select(Challenge)
@@ -99,11 +101,11 @@ class ChallengeService:
                 .where(Challenge.status == "active")
             )
             existing = result.scalar_one_or_none()
-            
+
             if existing:
                 logger.info(f"User {telegram_id} already has active challenge")
                 return None
-            
+
             # Создаём челлендж
             challenge = Challenge(
                 user_id=user.id,
@@ -117,9 +119,9 @@ class ChallengeService:
                 days_failed=0,
                 status="active"
             )
-            
+
             session.add(challenge)
-            
+
             # Сохраняем в user.active_challenge для быстрого доступа
             user.active_challenge = {
                 "id": None,  # Будет обновлено после commit
@@ -130,16 +132,18 @@ class ChallengeService:
                 "days_completed": 0,
                 "days_failed": 0,
             }
-            
+
+            await session.flush()
+
+            # Присваиваем новый словарь целиком: изменения внутри JSON-значения
+            # SQLAlchemy не отслеживает, и id челленджа оставался None — из-за
+            # этого отменённый челлендж не закрывался, а новый было не начать.
+            user.active_challenge = {**user.active_challenge, "id": challenge.id}
             await session.commit()
-            
-            # Обновляем ID
-            user.active_challenge["id"] = challenge.id
-            await session.commit()
-            
+
             logger.info(f"User {telegram_id} started challenge: {challenge_type}")
             return challenge
-    
+
     async def cancel_challenge(self, telegram_id: int) -> bool:
         """Отменяет активный челлендж"""
         async with AsyncSessionLocal() as session:
@@ -147,10 +151,10 @@ class ChallengeService:
                 select(User).where(User.telegram_id == telegram_id)
             )
             user = result.scalar_one_or_none()
-            
+
             if not user or not user.active_challenge:
                 return False
-            
+
             # Получаем челлендж
             challenge_id = user.active_challenge.get("id")
             if challenge_id:
@@ -160,21 +164,21 @@ class ChallengeService:
                 challenge = result.scalar_one_or_none()
                 if challenge:
                     challenge.status = "cancelled"
-                    challenge.completed_at = datetime.now()
-            
+                    challenge.completed_at = utc_now()
+
             user.active_challenge = None
             await session.commit()
-            
+
             logger.info(f"User {telegram_id} cancelled challenge")
             return True
-    
+
     async def check_daily_progress(
-        self, 
+        self,
         telegram_id: int
     ) -> Optional[Dict]:
         """
         Проверяет прогресс за текущий день.
-        
+
         Returns:
             Dict с результатом проверки или None
         """
@@ -183,42 +187,41 @@ class ChallengeService:
                 select(User).where(User.telegram_id == telegram_id)
             )
             user = result.scalar_one_or_none()
-            
+
             if not user or not user.active_challenge:
                 return None
-            
+
             challenge_data = user.active_challenge
             challenge_type = challenge_data.get("type")
-            
+
             if challenge_type not in CHALLENGE_TYPES:
                 return None
-            
+
             challenge_info = CHALLENGE_TYPES[challenge_type]
-            today = date.today()
-            
-            # Получаем записи за сегодня
-            start_dt = datetime.combine(today, datetime.min.time())
-            end_dt = datetime.combine(today, datetime.max.time())
-            
+            zone = get_zone(user.timezone)
+            today = local_today(zone)
+
+            start_dt, end_dt = local_day_bounds(zone, today)
             result = await session.execute(
                 select(DiaryEntry)
                 .where(DiaryEntry.user_id == user.id)
                 .where(DiaryEntry.date >= start_dt)
-                .where(DiaryEntry.date <= end_dt)
+                .where(DiaryEntry.date < end_dt)
             )
-            entries = result.scalars().all()
-            
+            # Вода — не еда: стакан воды после 21:00 не должен проваливать челлендж.
+            entries = [e for e in result.scalars().all() if e.meal_type != "вода"]
+
             # Проверяем в зависимости от типа челленджа
             passed = True
             reason = ""
-            
+
             if "check_keywords" in challenge_info:
                 # Проверка на запрещённые продукты
                 keywords = challenge_info["check_keywords"]
                 after_hour = challenge_info.get("check_after_hour", 0)
-                
+
                 for entry in entries:
-                    if entry.date.hour >= after_hour:
+                    if to_local(entry.date, zone).hour >= after_hour:
                         food_lower = entry.food_name.lower()
                         for keyword in keywords:
                             if keyword in food_lower:
@@ -227,7 +230,7 @@ class ChallengeService:
                                 break
                     if not passed:
                         break
-            
+
             elif challenge_info.get("check_type") == "protein_goal":
                 # Проверка на норму белка
                 total_protein = sum(e.protein or 0 for e in entries)
@@ -235,39 +238,41 @@ class ChallengeService:
                 if total_protein < target:
                     passed = False
                     reason = f"Белок: {total_protein:.0f}г из {target:.0f}г нужных"
-            
+
             elif challenge_info.get("check_type") == "min_entries":
                 # Проверка на минимум записей
                 if len(entries) < challenge_info["min_entries"]:
                     passed = False
                     reason = f"Записей: {len(entries)} из {challenge_info['min_entries']} нужных"
-            
+
             elif "check_after_hour" in challenge_info:
                 # Проверка на время
                 after_hour = challenge_info["check_after_hour"]
                 for entry in entries:
-                    if entry.date.hour >= after_hour:
+                    if to_local(entry.date, zone).hour >= after_hour:
                         passed = False
                         reason = f"Еда после {after_hour}:00: {entry.food_name}"
                         break
-            
+
             return {
                 "passed": passed,
                 "reason": reason,
                 "challenge_name": challenge_data["name"],
+                "date": today.isoformat(),
                 "days_completed": challenge_data["days_completed"],
                 "days_failed": challenge_data["days_failed"],
                 "total_days": challenge_info["duration"]
             }
-    
+
     async def update_challenge_progress(
-        self, 
-        telegram_id: int, 
-        day_passed: bool
+        self,
+        telegram_id: int,
+        day_passed: bool,
+        checked_date: Optional[str] = None
     ) -> Optional[Dict]:
         """
         Обновляет прогресс челленджа после проверки дня.
-        
+
         Returns:
             Dict с обновлённым статусом
         """
@@ -276,27 +281,31 @@ class ChallengeService:
                 select(User).where(User.telegram_id == telegram_id)
             )
             user = result.scalar_one_or_none()
-            
+
             if not user or not user.active_challenge:
                 return None
-            
-            challenge_data = user.active_challenge
+
+            # Работаем с копией: изменения внутри исходного словаря SQLAlchemy
+            # не отслеживает, и прогресс не доезжал бы до базы.
+            challenge_data = dict(user.active_challenge)
             challenge_id = challenge_data.get("id")
-            
+            if checked_date:
+                challenge_data["last_checked_date"] = checked_date
+
             # Обновляем прогресс
             if day_passed:
                 challenge_data["days_completed"] = challenge_data.get("days_completed", 0) + 1
             else:
                 challenge_data["days_failed"] = challenge_data.get("days_failed", 0) + 1
-            
+
             # Проверяем завершение
             total = challenge_data["days_completed"] + challenge_data["days_failed"]
             challenge_type = challenge_data.get("type")
             duration = CHALLENGE_TYPES.get(challenge_type, {}).get("duration", 7)
-            
+
             status = "active"
             result_text = None
-            
+
             if total >= duration:
                 status = "completed"
                 # Определяем результат
@@ -306,9 +315,9 @@ class ChallengeService:
                     result_text = "partial"
                 else:
                     result_text = "failed"
-            
+
             user.active_challenge = challenge_data if status == "active" else None
-            
+
             # Обновляем запись в таблице challenges
             if challenge_id:
                 result = await session.execute(
@@ -321,31 +330,31 @@ class ChallengeService:
                     if status == "completed":
                         challenge.status = "completed"
                         challenge.result = result_text
-                        challenge.completed_at = datetime.now()
-            
+                        challenge.completed_at = utc_now()
+
             await session.commit()
-            
+
             return {
                 "status": status,
                 "days_completed": challenge_data["days_completed"],
                 "days_failed": challenge_data["days_failed"],
                 "result": result_text
             }
-    
+
     def format_challenge_result(self, result: str, name: str) -> str:
         """Форматирует результат челленджа"""
         if result == "success":
-            return f"🎉 Челлендж «{name}» пройден!\n\nОтлично! Ты справился на 100%. Это показывает, что ты можешь придерживаться плана."
+            return f"🎉 Челлендж «{name}» пройден!\n\nОтлично! Вы справились на 100%. Это показывает, что вы можете придерживаться плана."
         elif result == "partial":
-            return f"👍 Челлендж «{name}» почти пройден!\n\nНе идеально, но ты старался — и это главное. Хочешь попробовать ещё раз?"
+            return f"👍 Челлендж «{name}» почти пройден!\n\nНе идеально, но вы старались — и это главное. Хотите попробовать ещё раз?"
         else:
             return f"😌 Челлендж «{name}» не зашёл — и это ок.\n\nНе все эксперименты удаются, это нормально. Может, попробуем что-то другое?"
-    
+
     def format_challenge_proposal(self, challenge: Dict) -> str:
         """Форматирует предложение челленджа"""
         return f"""🎯 **Мини-челлендж**
 
-Хочешь попробовать: **{challenge['name']}**?
+Хотите попробовать: **{challenge['name']}**?
 
 {challenge['description']}
 Длительность: {challenge['duration']} дней

@@ -445,7 +445,7 @@ async def registration_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             await session.commit()
             logger.info(f"User {user.id} completed registration")
 
-        from bot.handlers import get_main_keyboard, format_target_warnings
+        from bot.handlers import get_main_keyboard, format_target_warnings, ask_timezone
 
         warnings_text = format_target_warnings(calorie_data.get("warnings", []))
 
@@ -460,20 +460,10 @@ async def registration_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown"
         )
 
-        await update.message.reply_text(
-            "Попробуйте прямо сейчас — просто напишите, что вы ели сегодня:\n\n"
-            "💬 _«Съел овсянку на молоке и кофе с сахаром»_\n\n"
-            "Я посчитаю калории и запишу в дневник. Если чего-то не хватит для точности — переспрошу.\n\n"
-            "Ещё умею:\n"
-            "🍳 подобрать рецепт из того, что есть дома\n"
-            "📸 оценить блюдо по фотографии\n"
-            "📈 показать, как прошёл день и чем добрать норму\n\n"
-            "Всё это — в кнопках ниже 👇",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-
+        # Данные регистрации больше не нужны; флаги вопроса о поясе ставит ask_timezone.
+        # Подсказки о возможностях бот покажет сразу после ответа о поясе.
         context.user_data.clear()
+        await ask_timezone(update.message, context, onboarding=True)
         return ConversationHandler.END
 
     except Exception as e:
